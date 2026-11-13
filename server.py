@@ -138,7 +138,7 @@ async def task_status(tid: str):
 
 @app.get("/api/tasks")
 async def all_tasks():
-    return {k: {k2: v.get(k2) for k2 in ("status", "stage", "mode", "error")}
+    return {k: {k2: v.get(k2) for k2 in ("status", "stage", "mode", "error", "ep_name")}
             for k, v in _tasks.items()}
 
 
@@ -378,9 +378,10 @@ async function submit(){
 async function refresh(){
   const d=await(await fetch('/api/tasks')).json();
   $('tasks').innerHTML=Object.entries(d).map(([id,t])=>{
+    const label=t.ep_name||({jf:'Jellyfin 任务',auto:'本地任务（识别+翻译）',transcribe:'本地任务（识别）',translate:'本地任务（翻译）'}[t.mode]||t.mode);
     const st=t.status==='done'?(t.mode==='jf'?'已上传 Jellyfin':(t.stage||'完成')):t.status;
-    return `<div class="task"><b>${id}</b><span class="name">${t.mode}${t.error?' — '+t.error.slice(0,60):''}</span>
-      <span class="badge ${t.status}">${st}</span></div>`;}).join('')
+    return `<div class="task"><span class="name">${label}${t.error?' — '+t.error.slice(0,60):''}</span>
+      <b>${id}</b><span class="badge ${t.status}">${st}</span></div>`;}).join('')
     ||'<div class="empty">暂无任务 — 提交视频或在 Jellyfin 里勾选剧集</div>';
 }
 async function loadCfg(){
