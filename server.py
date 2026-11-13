@@ -3,6 +3,7 @@
 import os
 import queue
 import subprocess
+import sys
 import threading
 import uuid
 import yaml
@@ -82,7 +83,7 @@ def _worker():
                 script += "fancap.pipeline_%s(%r, %r, cfg, log=print)\n" % (
                     t["mode"], t["input"], prefix)
             proc = subprocess.run(
-                ["python3", "-"], input=script,
+                [sys.executable, "-"], input=script,
                 capture_output=True, text=True, timeout=3600,
             )
             for line in (proc.stdout + proc.stderr).splitlines():
@@ -227,6 +228,31 @@ async def set_prompt(body: dict):
     return {"ok": True}
 
 
+@app.post("/api/test-translate")
+async def test_translate():
+    """Test the configured translation endpoint with a tiny request."""
+    cfg = load_cfg()
+    if not cfg.api_key:
+        raise HTTPException(400, "未配置 API Key")
+    from openai import OpenAI
+    try:
+        client = OpenAI(base_url=cfg.base_url, api_key=cfg.api_key, timeout=20)
+        t0 = __import__("time").time()
+        resp = client.chat.completions.create(
+            model=cfg.model,
+            messages=[{"role": "user", "content": "把「今日はいい天気ですね」翻译成中文，只输出译文"}],
+            temperature=0,
+        )
+        dt = __import__("time").time() - t0
+        text = resp.choices[0].message.content.strip()
+        return {"ok": True, "latency": round(dt, 2), "sample": text[:100],
+                "model": cfg.model, "base_url": cfg.base_url}
+    except Exception as e:
+        return JSONResponse(status_code=502, content={
+            "ok": False, "error": str(e)[:400],
+            "base_url": cfg.base_url, "model": cfg.model})
+
+
 # ---------------------------------------------------------------- ui
 
 @app.get("/", response_class=HTMLResponse)
@@ -325,6 +351,7 @@ a{color:var(--run);text-decoration:none}
  <label>API Key</label><input id="api_key" type="password">
  <label>模型</label><input id="model" placeholder="deepseek-chat">
  <button onclick="saveCfg()">保存</button>
+ <button class="ghost" onclick="testTrans()">测试连通性</button>
  <div class="hint">未填写 API Key 时只输出原文，不翻译。</div>
 </section>
 
@@ -378,6 +405,14 @@ async function savePrompt(){
 async function resetPrompt(){
   const p=await(await fetch('/api/prompt')).json();
   $('prompt_ta').value=p.default;savePrompt();
+}
+async function testTrans(){
+  await saveCfg();
+  flash('测试中…');
+  const r=await fetch('/api/test-translate',{method:'POST'});
+  const d=await r.json();
+  if(d.ok){flash(`连通 ✓ ${d.latency}s — 示例: ${d.sample}`);}
+  else{flash('失败: '+d.error.slice(0,150),true);}
 }
 async function saveJf(){
   const d=await(await fetch('/api/config')).json();
