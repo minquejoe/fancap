@@ -50,7 +50,7 @@ class Jellyfin:
 
     def episodes(self, series_id: str, season_id: str = None):
         uid = self.get_user_id()
-        params = {"userId": uid, "Fields": "MediaStreams"}
+        params = {"userId": uid, "Fields": "MediaStreams,Path,PathSeparator"}
         if season_id:
             params["seasonId"] = season_id
         r = httpx.get(f"{self.base}/Shows/{series_id}/Episodes",
@@ -64,7 +64,11 @@ class Jellyfin:
                     for s in streams if s.get("Type") == "Subtitle"]
             has_zh = any(s["lang"].lower() in ZH_LANGS for s in subs)
             out.append({"id": i["Id"], "name": i.get("Name", "?"),
-                        "ep": i.get("IndexNumber"), "has_zh": has_zh, "subs": subs})
+                        "ep": i.get("IndexNumber"),
+                        "series": i.get("SeriesName", ""),
+                        "season": i.get("ParentIndexNumber"),
+                        "path": i.get("Path", ""),
+                        "has_zh": has_zh, "subs": subs})
         return out
 
     def stream_url(self, item_id: str) -> str:

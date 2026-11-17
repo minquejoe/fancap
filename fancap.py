@@ -273,6 +273,102 @@ def pipeline_translate(subtitle_in: str, out_prefix: str, cfg: Config, log=print
     return final
 
 
+def clean_search_query(series: str, ep, ep_name: str, path: str) -> str:
+    """Build a subtitle-site search query from scraped Jellyfin metadata."""
+    # prefer clean series + episode number; fall back to cleaned filename
+    base = (series or "").strip()
+    if base:
+        q = f"{base} 第{ep}集" if ep else base
+        return q
+    if path:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        # strip release tags commonly found in anime filenames
+        stem = re.sub(r'[\[\(【].*?[\]\)】]', ' ', stem)          # [] () 【】 groups
+        stem = re.sub(r'(1080p|720p|4K|HEVC|x264|x265|h264|h265|Ma10p|Ma8p|Flac|AAC|BDRip|WEB-DL|HDTV|BD|NVENC|10bit|8bit)',
+                      ' ', stem, flags=re.I)
+        stem = re.sub(r'\s+', ' ', stem).strip()
+        if stem:
+            return stem
+    return ep_name or ""
+
+
+def pipeline_jf_search(jf_url: str, jf_key: str, item_id: str,
+                       series: str, ep, ep_name: str, path: str,
+                       out_prefix: str, cfg: Config, log=print):
+    """Jellyfin episode via subtitle-site search first (scraped metadata, read-only),
+    NPU ASR as fallback. Upload back to Jellyfin when subtitle is obtained.
+    Never triggers Jellyfin metadata refresh/scraping tasks."""
+    from sources import (search_all, subtitlecat_download, looks_chinese_content,
+                         is_chinese_subtitle)
+    import pysubs2
+    import tempfile
+    import shutil
+
+    query = clean_search_query(series, ep, ep_name, path)
+    log(f"[JF] 处理: {ep_name}")
+    log(f"[1/5] 字幕站搜索（用已刮削元数据，不触发刮削）: {query}")
+    results = []
+    try:
+        results = search_all(query, limit=10)
+        if not results and series and ep:
+            log("    无结果，放宽为剧名搜索…")
+            results = search_all(series, limit=10)
+    except Exception as e:
+        log(f"    搜索失败: {str(e)[:80]}")
+
+    segs = None
+    if results:
+        zh = [r for r in results if r.get("lang") == "zh" or is_chinese_subtitle(r["title"])]
+        ordered = zh + [r for r in results if r not in zh]
+        log(f"    {len(results)} 条结果，中文 {len(zh)} 条")
+        raw = None
+        for cand in ordered:
+            if cand.get("source") != "subtitlecat":
+                continue
+            try:
+                raw, dl_url = subtitlecat_download(cand["url"])
+                log(f"    下载: {cand['title']}")
+                break
+            except Exception as e:
+                log(f"    跳过 {cand['title'][:40]}: {str(e)[:60]}")
+        if raw is not None:
+            tmp = tempfile.mktemp(suffix=".srt")
+            with open(tmp, "wb") as f:
+                f.write(raw)
+            try:
+                subs = pysubs2.load(tmp, encoding="utf-8")
+            except Exception:
+                subs = pysubs2.load(tmp, encoding="gbk")
+            segs = [(e.start / 1000, e.end / 1000, e.plaintext)
+                    for e in subs.events if not e.is_comment]
+            os.remove(tmp)
+            log(f"    {len(segs)} 条字幕")
+            content = "\n".join(t for _, _, t in segs)
+            if looks_chinese_content(content):
+                log("    已是中文字幕，直接使用")
+            else:
+                src_lang = "日语" if _looks_ja([(0, 0, t) for t in content.splitlines()]) else "外语"
+                log(f"    外语字幕，翻译（{src_lang}→中文）…")
+                zh_texts = translate_lines([t for _, _, t in segs], src_lang, cfg)
+                segs = [(s, e, z) for (s, e, _), z in zip(segs, zh_texts)]
+
+    if segs is None:
+        log("[2/5] 字幕站无可用字幕，落回 NPU 识别流程…")
+        return pipeline_jf(jf_url, jf_key, item_id, ep_name, cfg, log=log)
+
+    write_srt(segs, out_prefix + ".srt")
+    write_ass(segs, out_prefix + ".ass")
+    log(f"    已生成: {out_prefix}.srt / .ass")
+
+    log(f"[5/5] 上传到 Jellyfin…")
+    from jellyfin import Jellyfin
+    jf = Jellyfin(jf_url, jf_key)
+    srt_text = open(out_prefix + ".srt", encoding="utf-8").read()
+    st = jf.upload_subtitle(item_id, srt_text)
+    log(f"    已上传 Jellyfin (HTTP {st})")
+    return segs
+
+
 def pipeline_jf(jf_url: str, jf_key: str, item_id: str, ep_name: str, cfg: Config, log=print):
     """Jellyfin episode: stream audio -> NPU ASR -> translate -> upload srt back."""
     from jellyfin import Jellyfin
@@ -317,7 +413,8 @@ def pipeline_sub_search(query: str, out_prefix: str, cfg: Config, log=print,
                         upload_to_jf: str = None):
     """Search subtitle sites for the query, download best Chinese/foreign sub,
     translate if needed, write srt/ass. Optionally upload to a Jellyfin item."""
-    from sources import search_all, subtitlecat_download, looks_chinese_content
+    from sources import (search_all, subtitlecat_download, looks_chinese_content,
+                         is_chinese_subtitle)
     log(f"[SS] 搜索字幕: {query}")
     results = search_all(query, limit=10)
     if not results:

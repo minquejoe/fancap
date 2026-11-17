@@ -79,6 +79,12 @@ def _worker():
                 script += (
                     "fancap.pipeline_jf(%r, %r, %r, %r, cfg, log=print)\n"
                 ) % (t["jf_url"], t["jf_key"], t["item_id"], t.get("ep_name", ""))
+            elif t["mode"] == "jf_search":
+                script += (
+                    "fancap.pipeline_jf_search(%r, %r, %r, %r, %r, %r, %r, %r, cfg, log=print)\n"
+                ) % (t["jf_url"], t["jf_key"], t["item_id"],
+                     t.get("series", ""), t.get("ep"), t.get("ep_name", ""),
+                     t.get("path", ""), prefix)
             elif t["mode"] == "search":
                 script += (
                     "fancap.pipeline_sub_search(%r, %r, cfg, log=print)\n"
@@ -225,18 +231,47 @@ async def search_queue(body: dict):
 
 @app.post("/api/jf/queue")
 async def jf_queue(items: list[dict]):
+    """items: [{id, name}] of episode item ids; scraped metadata is fetched
+    server-side (read-only) to build search queries."""
     jd = _load_yaml().get("jellyfin") or {}
     base = jd.get("base_url", "")
     key = jd.get("api_key", "")
     if not base or not key:
         raise HTTPException(400, "jellyfin not configured")
     queued = []
+    # fetch scraped metadata once (read-only) for all episodes
+    meta = {}
+    if items:
+        from jellyfin import Jellyfin
+        jf = Jellyfin(base, key)
+        uid = jf.get_user_id()
+        for it in items:
+            try:
+                r = httpx.get(f"{base}/Users/{uid}/Items/{it['id']}",
+                              headers=jf.headers, timeout=15)
+                r.raise_for_status()
+                i = r.json()
+                streams = i.get("MediaStreams") or []
+                subs = [{"idx": s.get("Index"), "lang": s.get("Language") or "?",
+                         "disp": s.get("DisplayTitle") or ""}
+                        for s in streams if s.get("Type") == "Subtitle"]
+                has_zh = any(s["lang"].lower() in ("chi", "zh", "zho", "zh-cn", "chs", "zh-hans") for s in subs)
+                meta[it["id"]] = {"series": i.get("SeriesName", ""),
+                                  "ep": i.get("IndexNumber"),
+                                  "name": i.get("Name", ""),
+                                  "path": i.get("Path", ""),
+                                  "has_zh": has_zh}
+            except Exception:
+                pass
     for it in items:
         tid = uuid.uuid4().hex[:8]
+        m = meta.get(it["id"], {})
         _tasks[tid] = {"status": "queued", "stage": "-", "log": [], "files": [],
-                       "mode": "jf", "error": None,
+                       "mode": "jf_search", "error": None,
                        "jf_url": base, "jf_key": key,
-                       "item_id": it["id"], "ep_name": it.get("name", "")}
+                       "item_id": it["id"], "ep_name": it.get("name", ""),
+                       "series": m.get("series", ""), "ep": m.get("ep"),
+                       "path": m.get("path", "")}
         _queue.put(tid)
         queued.append(tid)
     return {"queued": queued}
@@ -418,7 +453,7 @@ async function submit(){
 async function refresh(){
   const d=await(await fetch('/api/tasks')).json();
   $('tasks').innerHTML=Object.entries(d).map(([id,t])=>{
-    const label=t.ep_name||({jf:'Jellyfin 任务',auto:'本地任务（识别+翻译）',transcribe:'本地任务（识别）',translate:'本地任务（翻译）'}[t.mode]||t.mode);
+    const label=t.ep_name||({jf:'Jellyfin 任务',jf_search:'Jellyfin（搜索优先）',auto:'本地任务（识别+翻译）',transcribe:'本地任务（识别）',translate:'本地任务（翻译）',search:'搜索字幕'}[t.mode]||t.mode);
     const st=t.status==='done'?(t.mode==='jf'?'已上传 Jellyfin':(t.stage||'完成')):t.status;
     return `<div class="task"><span class="name">${label}${t.error?' — '+t.error.slice(0,60):''}</span>
       <b>${id}</b><span class="badge ${t.status}">${st}</span></div>`;}).join('')
@@ -476,6 +511,7 @@ async function loadSeries(){
 }
 async function loadEps(sid,name){
   const r=await fetch('/api/jf/episodes/'+sid);const eps=await r.json();
+  window._jf_sid=sid;
   $('jf_browse').innerHTML=`<div class="task"><span class="name"><b>${name}</b></span>
     <button class="ghost small" onclick="loadSeries()">返回</button>
     <button class="small" onclick="queueSel()">处理选中</button></div>`+
@@ -486,10 +522,10 @@ async function loadEps(sid,name){
    </div>`).join('');
 }
 async function queueSel(){
-  const items=[...document.querySelectorAll('.epcb:checked')].map(c=>({id:c.dataset.id,name:c.dataset.name}));
+  const items=[...document.querySelectorAll('.epcb:checked')].map(c=>({id:c.dataset.id,name:c.dataset.name,series_id:window._jf_sid}));
   if(!items.length){flash('未勾选任何集',true);return;}
   const r=await fetch('/api/jf/queue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(items)});
-  if(r.ok){flash('已入队 '+items.length+' 集');refresh();}
+  if(r.ok){flash('已入队 '+items.length+' 集（先搜索在线字幕，无则 NPU 识别）');refresh();}
 }
 async function searchSubs(){
   const q=$('ss_query').value.trim();if(!q){flash('输入搜索词',true);return;}
