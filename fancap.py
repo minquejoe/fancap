@@ -313,6 +313,72 @@ def pipeline_jf(jf_url: str, jf_key: str, item_id: str, ep_name: str, cfg: Confi
     return True
 
 
+def pipeline_sub_search(query: str, out_prefix: str, cfg: Config, log=print,
+                        upload_to_jf: str = None):
+    """Search subtitle sites for the query, download best Chinese/foreign sub,
+    translate if needed, write srt/ass. Optionally upload to a Jellyfin item."""
+    from sources import search_all, subtitlecat_download, looks_chinese_content
+    log(f"[SS] 搜索字幕: {query}")
+    results = search_all(query, limit=10)
+    if not results:
+        raise RuntimeError("没有找到匹配的字幕")
+    # prefer Chinese subs first, then any
+    zh = [r for r in results if r.get("lang") == "zh" or is_chinese_subtitle(r["title"])]
+    ordered = zh + [r for r in results if r not in zh]
+    log(f"    {len(results)} 条结果，中文 {len(zh)} 条")
+
+    from sources import subtitlecat_download as _dl
+    raw = None
+    chosen = None
+    for cand in ordered:
+        if cand.get("source") != "subtitlecat":
+            continue  # assrt needs token; skip when unconfigured
+        try:
+            raw, dl_url = _dl(cand["url"])
+            chosen = cand
+            log(f"    下载: {cand['title']}")
+            break
+        except Exception as e:
+            log(f"    跳过 {cand['title'][:40]}: {str(e)[:60]}")
+    if raw is None:
+        raise RuntimeError("所有候选字幕下载失败（assrt 需要 token 配置）")
+
+    import pysubs2
+    import tempfile
+    tmp = tempfile.mktemp(suffix=".srt")
+    with open(tmp, "wb") as f:
+        f.write(raw)
+    try:
+        subs = pysubs2.load(tmp, encoding="utf-8")
+    except Exception:
+        subs = pysubs2.load(tmp, encoding="gbk")
+    segs = [(e.start / 1000, e.end / 1000, e.plaintext)
+            for e in subs.events if not e.is_comment]
+    log(f"    {len(segs)} 条字幕")
+
+    content = "\n".join(t for _, _, t in segs)
+    if looks_chinese_content(content):
+        log("    已是中文字幕，直接使用")
+    else:
+        src_lang = "日语" if _looks_ja([(0, 0, t) for t in content.splitlines()]) else "外语"
+        log(f"    外语字幕，翻译（{src_lang}→中文）…")
+        zh_texts = translate_lines([t for _, _, t in segs], src_lang, cfg)
+        segs = [(s, e, z) for (s, e, _), z in zip(segs, zh_texts)]
+
+    write_srt(segs, out_prefix + ".srt")
+    write_ass(segs, out_prefix + ".ass")
+    os.remove(tmp)
+    log(f"完成: {out_prefix}.srt / .ass")
+
+    if upload_to_jf:
+        from jellyfin import Jellyfin
+        jf = Jellyfin(upload_to_jf[0], upload_to_jf[1])
+        srt_text = open(out_prefix + ".srt", encoding="utf-8").read()
+        st = jf.upload_subtitle(upload_to_jf[2], srt_text)
+        log(f"    已上传 Jellyfin (HTTP {st})")
+    return segs
+
+
 def _looks_ja(results) -> bool:
     import re
     text = " ".join(t for _, _, t in results)

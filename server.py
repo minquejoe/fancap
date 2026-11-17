@@ -79,6 +79,10 @@ def _worker():
                 script += (
                     "fancap.pipeline_jf(%r, %r, %r, %r, cfg, log=print)\n"
                 ) % (t["jf_url"], t["jf_key"], t["item_id"], t.get("ep_name", ""))
+            elif t["mode"] == "search":
+                script += (
+                    "fancap.pipeline_sub_search(%r, %r, cfg, log=print)\n"
+                ) % (t["query"], prefix)
             else:
                 script += "fancap.pipeline_%s(%r, %r, cfg, log=print)\n" % (
                     t["mode"], t["input"], prefix)
@@ -191,9 +195,36 @@ async def jf_episodes(series_id: str, season_id: str = None):
         raise HTTPException(502, str(e))
 
 
+@app.post("/api/search")
+async def search_subtitles(body: dict):
+    """Search subtitle sites. body: {query}."""
+    from sources import search_all
+    q = (body.get("query") or "").strip()
+    if not q:
+        raise HTTPException(400, "need query")
+    try:
+        return search_all(q, limit=10)
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+
+@app.post("/api/search-queue")
+async def search_queue(body: dict):
+    """Create a task: search subtitles for query, download, translate, output files.
+    body: {query, source_url?} — source_url picks a specific result."""
+    q = (body.get("query") or "").strip()
+    if not q:
+        raise HTTPException(400, "need query")
+    tid = uuid.uuid4().hex[:8]
+    _tasks[tid] = {"status": "queued", "stage": "-", "log": [], "files": [],
+                   "mode": "search", "error": None,
+                   "query": q, "ep_name": f"搜索字幕: {q}"}
+    _queue.put(tid)
+    return {"id": tid}
+
+
 @app.post("/api/jf/queue")
 async def jf_queue(items: list[dict]):
-    """items: [{id, name}] of episode item ids to process."""
     jd = _load_yaml().get("jellyfin") or {}
     base = jd.get("base_url", "")
     key = jd.get("api_key", "")
@@ -340,6 +371,15 @@ a{color:var(--run);text-decoration:none}
 </div>
 
 <section class="card">
+ <h3><span class="dot"></span>字幕搜索</h3>
+ <label>番剧名 / 视频文件名</label>
+ <input id="ss_query" placeholder="例如: Mob Psycho 100 S1E01" style="margin-bottom:.4rem">
+ <button onclick="searchSubs()">搜索字幕</button>
+ <button onclick="queueSearch()">直接搜索并翻译</button>
+ <div id="ss_results"></div>
+</section>
+
+<section class="card">
  <h3><span class="dot"></span>任务队列</h3>
  <div id="tasks"><div class="empty">加载中…</div></div>
 </section>
@@ -450,6 +490,23 @@ async function queueSel(){
   if(!items.length){flash('未勾选任何集',true);return;}
   const r=await fetch('/api/jf/queue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(items)});
   if(r.ok){flash('已入队 '+items.length+' 集');refresh();}
+}
+async function searchSubs(){
+  const q=$('ss_query').value.trim();if(!q){flash('输入搜索词',true);return;}
+  flash('搜索中…');
+  const r=await fetch('/api/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})});
+  if(!r.ok){flash('搜索失败: '+(await r.text()).slice(0,100),true);return;}
+  const rs=await r.json();
+  $('ss_results').innerHTML=rs.map(s=>
+    `<div class="eprow"><span class="name">${s.title}${s.lang==='zh'?' <span class="tag-zh">中文</span>':''}</span>
+     <span class="hint">${s.source}</span></div>`).join('')
+    ||'<div class="empty">无结果</div>';
+  if(rs.length)flash(`找到 ${rs.length} 条`);
+}
+async function queueSearch(){
+  const q=$('ss_query').value.trim();if(!q){flash('输入搜索词',true);return;}
+  const r=await fetch('/api/search-queue',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})});
+  if(r.ok){flash('搜索任务已创建: '+q);refresh();$('ss_results').innerHTML='';}
 }
 function flash(msg,err){
   const b=document.createElement('div');
